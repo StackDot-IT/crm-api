@@ -168,6 +168,7 @@ const fanOutFollowupNotification = async (followup, message, eventSubType, creat
       eventType,
       companyId: followup.companyId,
       branchId: followup.branchId ?? null,
+      senderId: createdById ?? null,
       recipientIds,
       leadId: followup.leadId ?? null,
       followupId: followup.id,
