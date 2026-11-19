@@ -33,6 +33,7 @@ docker login -u safik8
 docker build -t safik8/crm:api -f ./crm-api/Dockerfile ./crm-api
 
 # 2. Build Frontend Web image (from repository root)
+docker build -t safik8/crm:api -f ./crm-api/Dockerfile ./crm-api
 docker build -t safik8/crm:web -f ./crm-web/Dockerfile ./crm-web
 ```
 

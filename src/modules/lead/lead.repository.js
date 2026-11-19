@@ -345,7 +345,8 @@ export const findLeadById = async (id, tx = prisma) => {
     where: { id },
     include: {
       pipeline: { select: { id: true, companyId: true, branchId: true } },
-      stage: { select: { id: true, name: true, stageType: true, status: true } }
+      stage: { select: { id: true, name: true, stageType: true, status: true } },
+      status: { select: { id: true, name: true, code: true } }
     }
   });
 };

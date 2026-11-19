@@ -737,10 +737,12 @@ export const updateLeadService = async (leadId, data, actor, req = null) => {
   const altMobileChanged = data.alternateMobile !== undefined && data.alternateMobile !== lead.alternateMobile;
 
   if (mobileChanged || emailChanged || altMobileChanged) {
+    // Production approach: only test the fields that were ACTUALLY modified
+    // to prevent existing legacy collisions on unchanged fields from blocking edits.
     const duplicate = await findDuplicateLead({
-      mobile: data.mobile !== undefined ? data.mobile : lead.mobile,
-      email: data.email !== undefined ? data.email : lead.email,
-      alternateMobile: data.alternateMobile !== undefined ? data.alternateMobile : lead.alternateMobile,
+      mobile: mobileChanged ? data.mobile : null,
+      email: emailChanged ? data.email : null,
+      alternateMobile: altMobileChanged ? data.alternateMobile : null,
       companyId: updateData.companyId || lead.companyId,
       excludeLeadId: id
     });
@@ -759,9 +761,9 @@ export const updateLeadService = async (leadId, data, actor, req = null) => {
           updateData.statusId = dupStatus.id;
         }
       } else {
-        const matchedField = duplicate.mobile === data.mobile || duplicate.alternateMobile === data.mobile
+        const matchedField = (mobileChanged && (duplicate.mobile === data.mobile || duplicate.alternateMobile === data.mobile))
           ? "mobile"
-          : duplicate.email === data.email
+          : (emailChanged && duplicate.email === data.email)
           ? "email"
           : "alternateMobile";
 
@@ -792,12 +794,14 @@ export const updateLeadService = async (leadId, data, actor, req = null) => {
     }
   }
 
-  // Status transitions closure notes check
+  // Status transitions closure notes check:
+  // Only enforce closure notes if the lead is transitioning TO 'CLOSED' from an open/non-closed status.
   if (data.statusId) {
     const targetStatus = await prisma.leadStatus.findUnique({
       where: { id: data.statusId }
     });
-    if (targetStatus && targetStatus.code === "CLOSED") {
+    const isTransitioningToClosed = targetStatus?.code === "CLOSED" && lead.status?.code !== "CLOSED";
+    if (isTransitioningToClosed) {
       const notesValue = data.notes !== undefined ? data.notes : lead.notes;
       if (!notesValue || !notesValue.trim()) {
         throw new ValidationError("Validation failed", [
@@ -932,6 +936,19 @@ export const updateLeadService = async (leadId, data, actor, req = null) => {
 
     if (!updated.assignedToId && !updated.teamId) {
       await autoAssignLead(updated.id, tx);
+    }
+
+    // Downstream sync: If name, mobile, or email changed, sync with active Opportunity or Customer records
+    if (data.name !== undefined || data.mobile !== undefined || data.email !== undefined) {
+      const customerUpdate = {};
+      if (data.name !== undefined) customerUpdate.customerName = data.name;
+      if (data.mobile !== undefined) customerUpdate.contactNumber = data.mobile;
+      if (data.email !== undefined) customerUpdate.email = data.email || null;
+
+      await tx.customer.updateMany({
+        where: { leadId: id },
+        data: customerUpdate
+      });
     }
 
     // Refetch the lead to get any updates from auto-assignment
