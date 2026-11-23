@@ -1,68 +1,115 @@
-name: CRM API Production CI/CD
+name: CRM API — Build, Push & Deploy
 
+# Runs on every push to main, or manually from the Actions tab ("Run workflow").
 on:
   push:
-    branches:
-      - main
-      - dev
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to the server after pushing the image"
+        type: boolean
+        default: true
+
+# Never run two deploys of this repo at the same time
+concurrency:
+  group: crm-api-deploy
+  cancel-in-progress: false
 
 env:
-  REGISTRY: ghcr.io
+  IMAGE: ${{ vars.DOCKERHUB_NAMESPACE || 'jeeejagani' }}/crm-api
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/home/sddev/stackdot-crm' }}
 
 jobs:
-  build-and-push-image:
+  build-and-push:
+    name: Build & push image
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set lowercase image name
-        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Log in to the Container registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
+      - name: Image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=true
+          images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build & push
+        uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
+          pull: true
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
+    name: Deploy to server
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.deploy)
     runs-on: ubuntu-latest
-    needs: build-and-push-image
+    environment: production
     steps:
-      - name: Deploy to Server via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Keeps the server's compose file in sync with deploy/docker-compose.yml in this repo.
+      # The server's .env is never touched.
+      - name: Upload docker-compose.yml
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
           password: ${{ secrets.SERVER_PASSWORD }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          script: |
-            cd /home/sddev/stackdot-crm
-            docker-compose pull crm-api
-            docker-compose up -d crm-api
-            docker-compose exec -T crm-api npx prisma migrate deploy
+          source: deploy/docker-compose.yml
+          target: ${{ env.DEPLOY_PATH }}
+          strip_components: 1
 
+      - name: Pull & restart API
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,DEPLOY_PATH
+          script: |
+            set -e
+            cd "$DEPLOY_PATH"
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker compose pull crm-api
+            docker logout
+            # Migrations run automatically when the API container starts
+            docker compose up -d --no-deps crm-api
+
+            echo "Waiting for crm-api to become healthy..."
+            for i in $(seq 1 30); do
+              status=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q crm-api)")
+              [ "$status" = "healthy" ] && echo "crm-api is healthy" && break
+              [ "$i" = "30" ] && { echo "crm-api did not become healthy"; docker compose logs --tail=100 crm-api; exit 1; }
+              sleep 5
+            done
+
+            docker image prune -f
