@@ -4,9 +4,29 @@ import prisma from "../../config/db.js";
 import { recordAuditLog } from "../auditLog/auditLog.service.js";
 
 /**
+ * Helper to fetch all user IDs associated with a team (BDE owner + active members)
+ */
+async function getTeamMemberUserIds(teamId) {
+  if (!teamId) return [];
+  const team = await prisma.team.findUnique({
+    where: { id: Number(teamId) },
+    select: {
+      bdeId: true,
+      members: {
+        where: { removedAt: null },
+        select: { userId: true }
+      }
+    }
+  });
+  if (!team) return [];
+  const userIds = [team.bdeId, ...team.members.map((m) => m.userId)].filter(Boolean);
+  return Array.from(new Set(userIds));
+}
+
+/**
  * Builds Prisma 'where' clause for RevenueLog table queries based on filters
  */
-function buildRevenueWhereClause(filters) {
+async function buildRevenueWhereClause(filters) {
   const where = {};
 
   if (filters.companyId) {
@@ -16,7 +36,15 @@ function buildRevenueWhereClause(filters) {
     where.branchId = filters.branchId;
   }
   if (filters.teamId) {
-    where.teamId = filters.teamId;
+    const memberIds = await getTeamMemberUserIds(filters.teamId);
+    if (memberIds.length > 0) {
+      where.OR = [
+        { teamId: filters.teamId },
+        { deal: { closedById: { in: memberIds } } }
+      ];
+    } else {
+      where.teamId = filters.teamId;
+    }
   }
   if (filters.courseId) {
     where.productId = filters.courseId;
@@ -25,6 +53,7 @@ function buildRevenueWhereClause(filters) {
   // BDE Personal Revenue Isolation
   if (filters.closedById) {
     where.deal = {
+      ...(where.deal || {}),
       closedById: filters.closedById
     };
   }
@@ -57,8 +86,8 @@ function calcGrowth(current, previous) {
  * Repository: Find Revenue Summary & Key Metrics
  */
 export async function findSummaryMetrics(filters, prevFilters = {}) {
-  const currentWhere = buildRevenueWhereClause(filters);
-  const prevWhere = buildRevenueWhereClause(prevFilters);
+  const currentWhere = await buildRevenueWhereClause(filters);
+  const prevWhere = await buildRevenueWhereClause(prevFilters);
 
   // Current Period Aggregate
   const currentAgg = await prisma.revenueLog.aggregate({
@@ -160,7 +189,7 @@ export async function findSummaryMetrics(filters, prevFilters = {}) {
  * Repository: Find Month-by-Month Financial Report
  */
 export async function findMonthlyRevenueReport(filters, page = 1, limit = 20) {
-  const where = buildRevenueWhereClause(filters);
+  const where = await buildRevenueWhereClause(filters);
 
   // Fetch raw logs with deal and customer
   const logs = await prisma.revenueLog.findMany({
@@ -243,7 +272,7 @@ export async function findMonthlyRevenueReport(filters, page = 1, limit = 20) {
  * Repository: Find Quarter-by-Quarter Financial Report
  */
 export async function findQuarterlyRevenueReport(filters, page = 1, limit = 20) {
-  const where = buildRevenueWhereClause(filters);
+  const where = await buildRevenueWhereClause(filters);
 
   const logs = await prisma.revenueLog.findMany({
     where,
@@ -319,7 +348,7 @@ export async function findQuarterlyRevenueReport(filters, page = 1, limit = 20) 
  * Repository: Find Product Revenue Report
  */
 export async function findProductRevenueReport(filters, page = 1, limit = 20) {
-  const where = buildRevenueWhereClause(filters);
+  const where = await buildRevenueWhereClause(filters);
 
   const logs = await prisma.revenueLog.findMany({
     where,
@@ -403,11 +432,34 @@ export async function findProductRevenueReport(filters, page = 1, limit = 20) {
  * Repository: Find Team Revenue Report
  */
 export async function findTeamRevenueReport(filters, page = 1, limit = 20) {
-  const where = buildRevenueWhereClause(filters);
+  const where = await buildRevenueWhereClause(filters);
+
+  // Pre-load all active teams with their BDE and members for clean attribution
+  const activeTeams = await prisma.team.findMany({
+    where: { isDeleted: false, ...(filters.companyId && { companyId: filters.companyId }) },
+    select: {
+      id: true,
+      name: true,
+      code: true,
+      bdeId: true,
+      branch: { select: { id: true, name: true } },
+      members: { where: { removedAt: null }, select: { userId: true } }
+    }
+  });
+
+  // Map each userId to their primary team
+  const userToTeamMap = new Map();
+  activeTeams.forEach((t) => {
+    if (t.bdeId) userToTeamMap.set(t.bdeId, t);
+    t.members.forEach((m) => {
+      if (!userToTeamMap.has(m.userId)) userToTeamMap.set(m.userId, t);
+    });
+  });
 
   const logs = await prisma.revenueLog.findMany({
     where,
     include: {
+      deal: { select: { closedById: true } },
       team: {
         select: {
           id: true,
@@ -422,10 +474,15 @@ export async function findTeamRevenueReport(filters, page = 1, limit = 20) {
   const teamMap = new Map();
 
   logs.forEach((log) => {
-    const teamId = log.teamId || 0;
-    const teamName = log.team?.name || "Direct / Independent Sales";
-    const teamCode = log.team?.code || "N/A";
-    const branchName = log.team?.branch?.name || "N/A";
+    // 1. Direct log teamId
+    // 2. Or fallback to closedBy user's team
+    const fallbackTeam = log.deal?.closedById ? userToTeamMap.get(log.deal.closedById) : null;
+    const resolvedTeam = log.team || fallbackTeam;
+
+    const teamId = resolvedTeam?.id || 0;
+    const teamName = resolvedTeam?.name || "Direct / Independent Sales";
+    const teamCode = resolvedTeam?.code || "N/A";
+    const branchName = resolvedTeam?.branch?.name || "N/A";
 
     if (!teamMap.has(teamId)) {
       teamMap.set(teamId, {
@@ -477,7 +534,7 @@ export async function findTeamRevenueReport(filters, page = 1, limit = 20) {
  * Repository: Find Branch Revenue Report
  */
 export async function findBranchRevenueReport(filters, page = 1, limit = 20) {
-  const where = buildRevenueWhereClause(filters);
+  const where = await buildRevenueWhereClause(filters);
 
   const logs = await prisma.revenueLog.findMany({
     where,
@@ -551,7 +608,7 @@ export async function findBranchRevenueReport(filters, page = 1, limit = 20) {
  * Repository: Find Revenue Trend Data for Charting
  */
 export async function findRevenueTrendData(filters) {
-  const where = buildRevenueWhereClause(filters);
+  const where = await buildRevenueWhereClause(filters);
   const now = new Date();
   const targetYear = filters.year || now.getFullYear();
 

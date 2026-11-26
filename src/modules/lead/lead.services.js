@@ -388,6 +388,26 @@ export const createLeadService = async (data, actor, txClient = prisma, skipDeta
     resolvedStatusId = await findDefaultLeadStatus(companyId);
   }
 
+  // 4b. Auto-resolve teamId if assignedToId is present but teamId is omitted
+  let resolvedTeamId = data.teamId ? Number(data.teamId) : null;
+  if (!resolvedTeamId && data.assignedToId) {
+    const ownedTeam = await prisma.team.findFirst({
+      where: { bdeId: Number(data.assignedToId), isDeleted: false, status: "ACTIVE" },
+      select: { id: true }
+    });
+    if (ownedTeam) {
+      resolvedTeamId = ownedTeam.id;
+    } else {
+      const memberTeam = await prisma.teamMember.findFirst({
+        where: { userId: Number(data.assignedToId), removedAt: null, team: { isDeleted: false, status: "ACTIVE" } },
+        select: { teamId: true }
+      });
+      if (memberTeam) {
+        resolvedTeamId = memberTeam.teamId;
+      }
+    }
+  }
+
   // 5. Build create payload
   const now = new Date();
   const leadNumber = await generateLeadNumber(txClient, { companyId, branchId, date: now });
@@ -416,6 +436,7 @@ export const createLeadService = async (data, actor, txClient = prisma, skipDeta
     notes:            data.notes   || null,
     interestedFor:    resolvedInterestedFor,
     assignedToId:     data.assignedToId  ?? null,
+    teamId:           resolvedTeamId,
     isDeleted:        false,
     isDuplicate:      isDuplicateFlag,
     duplicateOfId:    duplicateOfId,
@@ -649,7 +670,25 @@ export const getLeadsService = async (query, actor) => {
       where.branchId = targetBranch;
     }
   }
-  if (query?.teamId)     where.teamId     = Number(query.teamId);
+  if (query?.teamId) {
+    const targetTeamId = Number(query.teamId);
+    const teamRecord = await prisma.team.findUnique({
+      where: { id: targetTeamId },
+      select: {
+        bdeId: true,
+        members: { where: { removedAt: null }, select: { userId: true } }
+      }
+    });
+    if (teamRecord) {
+      const teamUserIds = [teamRecord.bdeId, ...teamRecord.members.map((m) => m.userId)].filter(Boolean);
+      where.OR = [
+        { teamId: targetTeamId },
+        { assignedToId: { in: teamUserIds } }
+      ];
+    } else {
+      where.teamId = targetTeamId;
+    }
+  }
 
   // Lead management filters
   if (query?.sourceId)     where.sourceId     = Number(query.sourceId);
@@ -2745,6 +2784,27 @@ export const assignLeadsService = async (data, actor, req = null) => {
             }
           }
         });
+
+        // Sync teamId to existing Opportunities and RevenueLogs of this lead if updatedLead.teamId changed
+        if (updatedLead.teamId && updatedLead.teamId !== prevTeamId) {
+          await tx.opportunity.updateMany({
+            where: { leadId, isDeleted: false },
+            data: { teamId: updatedLead.teamId }
+          });
+
+          // Sync any completed deals/revenue logs
+          const opps = await tx.opportunity.findMany({
+            where: { leadId },
+            select: { id: true, deals: { select: { id: true } } }
+          });
+          const dealIds = opps.flatMap(o => (o.deals || []).map(d => d.id));
+          if (dealIds.length > 0) {
+            await tx.revenueLog.updateMany({
+              where: { dealId: { in: dealIds } },
+              data: { teamId: updatedLead.teamId }
+            });
+          }
+        }
 
         return updatedLead;
       });
