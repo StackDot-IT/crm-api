@@ -64,9 +64,16 @@ export const leadStageLogInclude = {
  * @param {object} tx - Prisma client or transaction
  * @param {number|null} maxRank - Authority rank threshold (only rank < maxRank returned)
  */
-export const findBranchUsers = async (branchId, tx = prisma, maxRank = null) => {
+export const findBranchUsers = async (branchId, tx = prisma, maxRank = null, companyId = null) => {
+  const where = { status: "ACTIVE" };
+  if (branchId) {
+    where.branchId = branchId;
+  } else if (companyId) {
+    where.companyId = companyId;
+  }
+  // If neither branchId nor companyId is specified (e.g. global Super Admin), find all active users
   const users = await tx.user.findMany({
-    where: { branchId, status: "ACTIVE" },
+    where,
     select: {
       id: true,
       name: true,
@@ -152,8 +159,8 @@ export const findLeadFormData = async (companyId, branchId, tx = prisma, maxRank
       orderBy: { sequenceOrder: "asc" }
     }),
 
-    // Branch users for assignment dropdown (strictly lower rank than logged-in user)
-    branchId ? findBranchUsers(branchId, tx, maxRank) : Promise.resolve([])
+    // Users for assignment dropdown: scoped by branch/company if available, else all active users
+    findBranchUsers(branchId, tx, maxRank, companyId)
   ]);
 
   // If company has no courses, ensure default "Other" course exists and is included
