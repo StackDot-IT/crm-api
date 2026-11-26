@@ -1,0 +1,80 @@
+# StackDot CRM — production stack
+#
+# Usage (on the server, in the folder holding this file + .env):
+#   docker compose pull
+#   docker compose up -d
+#
+# First deploy only — load baseline data (roles, super admin, default company):
+#   docker compose exec crm-api npx prisma db seed
+
+name: stackdot-crm
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-crm}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *default-logging
+    # Not published to the host. Uncomment to reach the DB from the server itself (e.g. backups/pgAdmin over SSH tunnel):
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  crm-api:
+    image: ${DOCKERHUB_NAMESPACE:-jeeejagani}/crm-api:${API_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      RUN_MIGRATIONS: "true"   # applies pending Prisma migrations on every start
+      DATABASE_URL: postgresql://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-crm}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-crm}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Set JWT_ACCESS_SECRET in .env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?Set JWT_REFRESH_SECRET in .env}
+      JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN:-15m}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      CLIENT_URL: ${CLIENT_URL:?Set CLIENT_URL in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_FROM: ${SMTP_FROM:-}
+    # Bound to localhost only, for a host reverse proxy serving a separate API domain.
+    # The browser app itself reaches the API through crm-web (/api, /socket.io).
+    ports:
+      - "127.0.0.1:${API_PORT:-5000}:5000"
+    logging: *default-logging
+
+  crm-web:
+    image: ${DOCKERHUB_NAMESPACE:-jeeejagani}/crm-web:${WEB_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - crm-api
+    # WEB_BIND=127.0.0.1 when a host reverse proxy (nginx + TLS) sits in front
+    ports:
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-80}:80"
+    logging: *default-logging
+
+volumes:
+  pgdata:

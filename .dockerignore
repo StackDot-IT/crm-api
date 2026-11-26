@@ -1,0 +1,24 @@
+# Dependencies are installed inside the image
+node_modules
+npm-debug.log*
+
+# Secrets / local config — never bake into the image
+.env
+.env.*
+
+# VCS, CI, docs, deploy files
+.git
+.gitignore
+.github
+.dockerignore
+Dockerfile
+deploy
+docs
+*.md
+
+# Local one-off / dummy-data scripts (not for production)
+scratch
+create_dummy_data.js
+delete-nexus.js
+seed-*.js
+test_reports.js

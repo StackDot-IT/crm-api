@@ -16,9 +16,16 @@ import dotenv from "dotenv"
 dotenv.config()
 
 // Cookie options
+// Secure cookies are only sent over HTTPS. Defaults to true in production;
+// set COOKIE_SECURE=false when the app is served over plain HTTP (e.g. an
+// internal IP without TLS), otherwise browsers drop the refresh cookie.
+const COOKIE_SECURE = process.env.COOKIE_SECURE
+    ? process.env.COOKIE_SECURE === "true"
+    : process.env.NODE_ENV === "production"
+
 const ACCESS_COOKIE_OPTIONS = {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: COOKIE_SECURE,
     sameSite: "lax",
     path: "/",
     maxAge: 15 * 60 * 1000  // 15 minutes
@@ -26,7 +33,7 @@ const ACCESS_COOKIE_OPTIONS = {
 
 const REFRESH_COOKIE_OPTIONS = {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: COOKIE_SECURE,
     sameSite: "lax",
     path: "/",
     maxAge: 7 * 24 * 60 * 60 * 1000  // 7 days
