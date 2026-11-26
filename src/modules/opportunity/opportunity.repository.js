@@ -228,6 +228,7 @@ export const createDealCustomerRevenueIfNeeded = async (tx, opportunity, status,
           data: {
             companyId: opportunity.companyId,
             branchId: opportunity.branchId || null,
+            teamId: opportunity.teamId || null,
             dealId: deal.id,
             customerId: customer.id,
             productId: opportunity.productId || null,
@@ -317,10 +318,11 @@ export const seedDefaultOpportunityStages = async (companyId, tx = prisma) => {
 export const createOpportunityTx = async (companyId, branchId, data, ownerId, createdById, req = null) => {
   return prisma.$transaction(async (tx) => {
     // 0a. Concurrency guard: ensure lead has not been converted in a parallel transaction
+    let leadTeamId = null;
     if (data.leadId) {
       const existingLead = await tx.lead.findUnique({
         where: { id: Number(data.leadId) },
-        select: { id: true, qualificationStatus: true, isDeleted: true }
+        select: { id: true, qualificationStatus: true, isDeleted: true, teamId: true }
       });
       if (!existingLead || existingLead.isDeleted) {
         throw new NotFoundError('Lead');
@@ -328,6 +330,7 @@ export const createOpportunityTx = async (companyId, branchId, data, ownerId, cr
       if (existingLead.qualificationStatus === 'CONVERTED') {
         throw new ValidationError('This lead has already been converted to an opportunity.');
       }
+      leadTeamId = existingLead.teamId;
     }
 
     // 0b. Resolve target OpportunityStage and default probability from payload or CompanySettings
@@ -404,7 +407,7 @@ export const createOpportunityTx = async (companyId, branchId, data, ownerId, cr
         opportunityName: data.opportunityName,
         leadId: data.leadId,
         productId: validProductId,
-        teamId: data.teamId || null,
+        teamId: data.teamId || leadTeamId || null,
         stageId: stageId,
         ownerId: ownerId,
         expectedRevenue: data.expectedRevenue,
