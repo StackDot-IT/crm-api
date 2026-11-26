@@ -1,115 +1,44 @@
-name: CRM API — Build, Push & Deploy
+name: stage-ci-pipeline
 
-# Runs on every push to main, or manually from the Actions tab ("Run workflow").
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-    inputs:
-      deploy:
-        description: "Deploy to the server after pushing the image"
-        type: boolean
-        default: true
 
-# Never run two deploys of this repo at the same time
-concurrency:
-  group: crm-api-deploy
-  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: write
 
-env:
-  IMAGE: ${{ vars.DOCKERHUB_NAMESPACE || 'jeeejagani' }}/crm-api
-  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/root/stackdot-crm' }}
 
 jobs:
-  build-and-push:
-    name: Build & push image
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Image tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short
-
-      - name: Build & push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          pull: true
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  deploy:
-    name: Deploy to server
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.deploy)
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Keeps the server's compose file in sync with deploy/docker-compose.yml in this repo.
-      # The server's .env is never touched.
-      - name: Upload docker-compose.yml
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USERNAME }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          password: ${{ secrets.SERVER_PASSWORD }}
-          port: ${{ secrets.SERVER_PORT || 22 }}
-          source: deploy/docker-compose.yml
-          target: ${{ env.DEPLOY_PATH }}
-          strip_components: 1
-
-      - name: Pull & restart API
-        uses: appleboy/ssh-action@v1.2.0
+      - uses: actions/checkout@v4
+      - name: Login Dockerhub
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USERNAME }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          password: ${{ secrets.SERVER_PASSWORD }}
-          port: ${{ secrets.SERVER_PORT || 22 }}
-          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,DEPLOY_PATH
-          script: |
-            set -e
-            cd "$DEPLOY_PATH"
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-            docker compose pull crm-api
-            docker logout
-            # Migrations run automatically when the API container starts
-            docker compose up -d --no-deps crm-api
+          STACKDOT_DOCKER_USERNAME: ${{secrets.STACKDOT_DOCKER_USERNAME}}
+          STACKDOT_DOCKER_PASSWORD: ${{secrets.STACKDOT_DOCKER_PASSWORD}}
+        run: docker login -u $STACKDOT_DOCKER_USERNAME -p $STACKDOT_DOCKER_PASSWORD
 
-            echo "Waiting for crm-api to become healthy..."
-            for i in $(seq 1 30); do
-              status=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q crm-api)")
-              [ "$status" = "healthy" ] && echo "crm-api is healthy" && break
-              [ "$i" = "30" ] && { echo "crm-api did not become healthy"; docker compose logs --tail=100 crm-api; exit 1; }
-              sleep 5
-            done
+      - name: Build the Docker image
+        run: docker build -t jeeejagani/crm-api .
+      - name: Push to Dockerhub
+        run: docker push jeeejagani/crm-api
+      - name: Change tag and push it to dockerhub   
+        run: | 
+          current_date=$(date "+%d.%m.%y.%H.%M.%S.%3N")
+          docker tag jeeejagani/crm-api jeeejagani/crm-api:$current_date
+          docker push jeeejagani/crm-api:$current_date
 
-            docker image prune -f
+      - name: Deploy to Ubuntu Server
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          SERVER_USERNAME: ${{ secrets.SERVER_USERNAME }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          sshpass -p "$SERVER_PASSWORD" ssh -o StrictHostKeyChecking=no $SERVER_USERNAME@$SERVER_IP << 'EOF'
+            cd ~/stackdot-crm
+            docker compose pull
+            docker compose up -d
+            docker system prune -f
+          EOF
